@@ -35,6 +35,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import net.snowflake.client.core.Constants;
 import net.snowflake.client.core.HttpClientSettingsKey;
 import net.snowflake.client.core.OCSPMode;
 import net.snowflake.client.core.ObjectMapperFactory;
@@ -858,5 +859,15 @@ public class SnowflakeUtil {
       return null;
     }
     return node.isValueNode() ? node.asText() : node.toString();
+  }
+
+  /**
+   * Check whether the OS is Windows
+   *
+   * @return boolean
+   */
+  @SnowflakeJdbcInternalApi
+  public static boolean isWindows() {
+    return Constants.getOS() == Constants.OS.WINDOWS;
   }
 }

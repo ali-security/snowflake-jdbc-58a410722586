@@ -4,6 +4,7 @@
 
 package net.snowflake.client.core;
 
+import static net.snowflake.client.jdbc.SnowflakeUtil.isWindows;
 import static net.snowflake.client.jdbc.SnowflakeUtil.systemGetEnv;
 import static net.snowflake.client.jdbc.SnowflakeUtil.systemGetProperty;
 
@@ -20,10 +21,18 @@ import java.io.Writer;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.Date;
+import java.util.EnumSet;
+import java.util.Set;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import net.snowflake.client.log.SFLogger;
 import net.snowflake.client.log.SFLoggerFactory;
 
@@ -45,6 +54,8 @@ class FileCacheManager {
   private File cacheLockFile;
 
   private File cacheDir;
+
+  private boolean onlyOwnerPermissions = true;
 
   private FileCacheManager() {}
 
@@ -78,12 +89,26 @@ class FileCacheManager {
     return this;
   }
 
+  FileCacheManager setOnlyOwnerPermissions(boolean onlyOwnerPermissions) {
+    this.onlyOwnerPermissions = onlyOwnerPermissions;
+    return this;
+  }
+
   /**
    * Override the cache file.
    *
    * @param newCacheFile a file object to override the default one.
    */
   void overrideCacheFile(File newCacheFile) {
+    if (!newCacheFile.exists()) {
+      LOGGER.debug("Cache file doesn't exists. File: {}", newCacheFile);
+    }
+    if (onlyOwnerPermissions) {
+      FileUtil.throwWhenPermiossionDifferentThanReadWriteForOwner(
+          newCacheFile, "Override cache file");
+    } else {
+      FileUtil.logFileUsage(newCacheFile, "Override cache file", false);
+    }
     this.cacheFile = newCacheFile;
     this.cacheDir = newCacheFile.getParentFile();
     this.baseCacheFileName = newCacheFile.getName();
@@ -115,15 +140,12 @@ class FileCacheManager {
     } else {
       // use user home directory to store the cache file
       String homeDir = systemGetProperty("user.home");
-      if (homeDir == null) {
-        // use tmp dir if not exists.
-        homeDir = systemGetProperty("java.io.tmpdir");
-      } else {
+      if (homeDir != null) {
         // Checking if home directory is writable.
         File homeFile = new File(homeDir);
         if (!homeFile.canWrite()) {
-          LOGGER.debug("Home directory not writeable, using tmpdir", false);
-          homeDir = systemGetProperty("java.io.tmpdir");
+          LOGGER.debug("Home directory not writeable, skip using cache", false);
+          homeDir = null;
         }
       }
       if (homeDir == null) {
@@ -154,16 +176,31 @@ class FileCacheManager {
       // If exists. the method returns false.
       // In this particular case, it doesn't matter as long as the file is
       // writable.
-      if (cacheFileTmp.createNewFile()) {
+      if (!cacheFileTmp.exists()) {
+        if (!isWindows() && onlyOwnerPermissions) {
+          Files.createFile(
+              cacheFileTmp.toPath(),
+              PosixFilePermissions.asFileAttribute(
+                  Stream.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE)
+                      .collect(Collectors.toSet())));
+        } else {
+          Files.createFile(cacheFileTmp.toPath());
+        }
         LOGGER.debug("Successfully created a cache file {}", cacheFileTmp);
       } else {
         LOGGER.debug("Cache file already exists {}", cacheFileTmp);
+      }
+      if (!ensureOwnerOnlyCacheFile(cacheFileTmp)) {
+        return this;
       }
       this.cacheFile = cacheFileTmp.getCanonicalFile();
       this.cacheLockFile =
           new File(this.cacheFile.getParentFile(), this.baseCacheFileName + ".lck");
     } catch (IOException | SecurityException ex) {
-      LOGGER.info("Failed to touch the cache file. Ignored. {}", cacheFileTmp.getAbsoluteFile());
+      LOGGER.info(
+          "Failed to touch the cache file: {}. Ignored. {}",
+          ex.getMessage(),
+          cacheFileTmp.getAbsoluteFile());
     }
     return this;
   }
@@ -179,13 +216,25 @@ class FileCacheManager {
         LOGGER.debug("Cache file doesn't exists. File: {}", cacheFile);
         return null;
       }
+      if (!ensureOwnerOnlyCacheFile(cacheFile)) {
+        return null;
+      }
 
       try (Reader reader =
           new InputStreamReader(new FileInputStream(cacheFile), DEFAULT_FILE_ENCODING)) {
+
+        if (onlyOwnerPermissions) {
+          FileUtil.throwWhenPermiossionDifferentThanReadWriteForOwner(cacheFile, "Read cache");
+          FileUtil.throwWhenOwnerDifferentThanCurrentUser(cacheFile, "Read cache");
+        } else {
+          FileUtil.logFileUsage(cacheFile, "Read cache", false);
+        }
         return OBJECT_MAPPER.readTree(reader);
       }
     } catch (IOException ex) {
       LOGGER.debug("Failed to read the cache file. No worry. File: {}, Err: {}", cacheFile, ex);
+    } catch (SecurityException ex) {
+      LOGGER.warn("Skip using cache file {}: {}", cacheFile, ex.getMessage());
     }
     return null;
   }
@@ -203,8 +252,17 @@ class FileCacheManager {
       if (input == null) {
         return;
       }
+      if (onlyOwnerPermissions && !isWindows()) {
+        writeOwnerOnlyCacheFile(input);
+        return;
+      }
       try (Writer writer =
           new OutputStreamWriter(new FileOutputStream(cacheFile), DEFAULT_FILE_ENCODING)) {
+        if (onlyOwnerPermissions) {
+          FileUtil.throwWhenPermiossionDifferentThanReadWriteForOwner(cacheFile, "Write to cache");
+        } else {
+          FileUtil.logFileUsage(cacheFile, "Write to cache", false);
+        }
         writer.write(input.toString());
       }
     } catch (IOException ex) {
@@ -316,5 +374,101 @@ class FileCacheManager {
       LOGGER.debug("Failed to get creation time. File/Dir: {}, Err: {}", targetFile, ex);
     }
     return -1;
+  }
+
+  private static final Set<PosixFilePermission> OWNER_ONLY_PERMISSIONS =
+      EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE);
+
+  /**
+   * Makes the cache file readable and writable only by the current user: tightens the permissions
+   * of a file left with wider ones, or recreates it in a directory only the current user can
+   * modify. Never throws.
+   *
+   * @return false when the file cannot be made owner-only and the cache must not be used
+   */
+  private boolean ensureOwnerOnlyCacheFile(File file) {
+    if (!onlyOwnerPermissions || isWindows()) {
+      return true;
+    }
+    Path path = file.toPath();
+    try {
+      if (!Files.exists(path, LinkOption.NOFOLLOW_LINKS)) {
+        Files.createFile(path, PosixFilePermissions.asFileAttribute(OWNER_ONLY_PERMISSIONS));
+        return true;
+      }
+      if (!Files.isSymbolicLink(path) && isOwnedByCurrentUser(path)) {
+        if (!hasOwnerOnlyPermissions(path)) {
+          LOGGER.warn("Restricting cache file {} permissions to the owner", path);
+          Files.setPosixFilePermissions(path, OWNER_ONLY_PERMISSIONS);
+        }
+        if (hasOwnerOnlyPermissions(path)) {
+          return true;
+        }
+      }
+      if (!isOnlyModifiableByCurrentUser(path.getParent())) {
+        LOGGER.warn("Cache file {} cannot be restricted to the owner, skip using cache", path);
+        return false;
+      }
+      LOGGER.warn("Recreating cache file {} with permissions restricted to the owner", path);
+      Files.delete(path);
+      Files.createFile(path, PosixFilePermissions.asFileAttribute(OWNER_ONLY_PERMISSIONS));
+      return hasOwnerOnlyPermissions(path);
+    } catch (IOException | RuntimeException ex) {
+      LOGGER.warn("Cannot check cache file {}: {}, skip using cache", path, ex.getMessage());
+      return false;
+    }
+  }
+
+  /** Writes to a new owner-only file and moves it over the cache file. Never throws. */
+  private void writeOwnerOnlyCacheFile(JsonNode input) {
+    Path target = cacheFile.toPath();
+    Path tmp = null;
+    try {
+      tmp =
+          Files.createTempFile(
+              target.getParent(),
+              baseCacheFileName,
+              ".tmp",
+              PosixFilePermissions.asFileAttribute(OWNER_ONLY_PERMISSIONS));
+      Files.write(tmp, input.toString().getBytes(DEFAULT_FILE_ENCODING));
+      Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+      tmp = null;
+    } catch (IOException | RuntimeException ex) {
+      LOGGER.warn("Failed to write the cache file {}: {}", target, ex.getMessage());
+    } finally {
+      if (tmp != null) {
+        try {
+          Files.deleteIfExists(tmp);
+        } catch (IOException ex) {
+          LOGGER.debug("Failed to delete temporary cache file {}", tmp);
+        }
+      }
+    }
+  }
+
+  private static boolean hasOwnerOnlyPermissions(Path path) throws IOException {
+    return OWNER_ONLY_PERMISSIONS.containsAll(
+        Files.getPosixFilePermissions(path, LinkOption.NOFOLLOW_LINKS));
+  }
+
+  private static boolean isOnlyModifiableByCurrentUser(Path dir) throws IOException {
+    if (dir == null
+        || !Files.isDirectory(dir, LinkOption.NOFOLLOW_LINKS)
+        || !isOwnedByCurrentUser(dir)) {
+      return false;
+    }
+    Set<PosixFilePermission> permissions =
+        Files.getPosixFilePermissions(dir, LinkOption.NOFOLLOW_LINKS);
+    return !permissions.contains(PosixFilePermission.GROUP_WRITE)
+        && !permissions.contains(PosixFilePermission.OTHERS_WRITE);
+  }
+
+  /** The owner is not checked when the current user is unknown, as in FileUtil. */
+  private static boolean isOwnedByCurrentUser(Path path) throws IOException {
+    String currentUser = systemGetProperty("user.name");
+    if (currentUser == null || FileUtil.UNKNOWN_USER_NAME_MARKER.equals(currentUser)) {
+      return true;
+    }
+    return currentUser.equalsIgnoreCase(Files.getOwner(path, LinkOption.NOFOLLOW_LINKS).getName());
   }
 }
