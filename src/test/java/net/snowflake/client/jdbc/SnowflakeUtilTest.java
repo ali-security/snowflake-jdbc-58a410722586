@@ -9,6 +9,8 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.mockingDetails;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -17,10 +19,16 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.sql.Types;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import net.snowflake.client.category.TestCategoryCore;
 import net.snowflake.client.core.ObjectMapperFactory;
+import net.snowflake.client.log.SFLogger;
+import org.apache.http.HttpVersion;
+import org.apache.http.message.BasicHttpResponse;
+import org.apache.http.message.BasicStatusLine;
 import org.junit.Test;
 import org.junit.experimental.categories.Category;
+import org.mockito.invocation.Invocation;
 
 @Category(TestCategoryCore.class)
 public class SnowflakeUtilTest extends BaseJDBCTest {
@@ -217,5 +225,43 @@ public class SnowflakeUtilTest extends BaseJDBCTest {
     long elapsed = System.currentTimeMillis() - start;
     assertTrue(
         "Glob matching should complete nearly instantly, took " + elapsed + "ms", elapsed < 1000);
+  }
+
+  /**
+   * Response headers can carry credential material (e.g. the SSE-C customer key), so only the
+   * header names may be handed to the logger, never the header values.
+   */
+  @Test
+  public void testLogResponseDetailsDoesNotLogHeaderValues() {
+    // pragma: allowlist nextline secret
+    final String customerKey = "3dOoaBhkBOv1L15q1QYdz6z5Rzg1qEQTsm2ANFcaZ8I=";
+    final String opaqueValue = "opaqueHeaderValueThatMustNotBeLogged";
+    BasicHttpResponse response =
+        new BasicHttpResponse(new BasicStatusLine(HttpVersion.HTTP_1_1, 403, "Forbidden"));
+    response.addHeader("x-amz-server-side-encryption-customer-key", customerKey);
+    response.addHeader("x-amz-meta-opaque", opaqueValue);
+
+    SFLogger logger = mock(SFLogger.class);
+    SnowflakeUtil.logResponseDetails(response, logger);
+
+    List<String> loggedArguments = new ArrayList<>();
+    for (Invocation invocation : mockingDetails(logger).getInvocations()) {
+      for (Object argument : invocation.getRawArguments()) {
+        if (argument instanceof Object[]) {
+          for (Object element : (Object[]) argument) {
+            loggedArguments.add(String.valueOf(element));
+          }
+        } else {
+          loggedArguments.add(String.valueOf(argument));
+        }
+      }
+    }
+
+    assertTrue(loggedArguments.contains("x-amz-server-side-encryption-customer-key"));
+    assertTrue(loggedArguments.contains("x-amz-meta-opaque"));
+    for (String argument : loggedArguments) {
+      assertFalse("customer key leaked: " + argument, argument.contains(customerKey));
+      assertFalse("header value leaked: " + argument, argument.contains(opaqueValue));
+    }
   }
 }
