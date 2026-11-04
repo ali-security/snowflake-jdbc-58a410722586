@@ -7,6 +7,7 @@ package net.snowflake.client.jdbc;
 import static org.hamcrest.CoreMatchers.equalTo;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertTrue;
+import static org.mockito.Mockito.CALLS_REAL_METHODS;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.anyInt;
 import static org.mockito.Mockito.mock;
@@ -87,18 +88,33 @@ class FakeSessionUtilExternalBrowser extends SessionUtilExternalBrowser {
    * @throws IOException if any IO error occurs
    */
   private static ServerSocket initMockServerSocket() throws IOException {
-    // mock client socket
-    final Socket mockSocket = mock(Socket.class);
-    final String str =
-        String.format("GET /?token=%s HTTP/1.1\r\nUSER-AGENT: snowflake client", MOCK_SAML_TOKEN);
-    InputStream stream = new ByteArrayInputStream(str.getBytes(StandardCharsets.UTF_8));
-    when(mockSocket.getInputStream()).thenReturn(stream);
-    when(mockSocket.getOutputStream()).thenReturn(new NullOutputStream());
+    final byte[] requestBytes =
+        String.format(
+                "GET /?token=%s HTTP/1.1\r\nUSER-AGENT: snowflake client\r\n\r\n", MOCK_SAML_TOKEN)
+            .getBytes(StandardCharsets.UTF_8);
 
-    // mock server socket
+    final Socket fakeSocket =
+        new Socket() {
+          @Override
+          public InputStream getInputStream() {
+            return new ByteArrayInputStream(requestBytes);
+          }
+
+          @Override
+          public OutputStream getOutputStream() {
+            return new NullOutputStream();
+          }
+
+          @Override
+          public void setSoTimeout(int timeout) {}
+
+          @Override
+          public void close() {}
+        };
+
     final ServerSocket mockServerSocket = mock(ServerSocket.class);
     when(mockServerSocket.getLocalPort()).thenReturn(12345);
-    when(mockServerSocket.accept()).thenReturn(mockSocket);
+    when(mockServerSocket.accept()).thenReturn(fakeSocket);
     return mockServerSocket;
   }
 
@@ -310,7 +326,7 @@ public class SSOConnectionTest {
   public void testIdTokenInSSO() throws Throwable {
     try (MockedStatic<HttpUtil> mockedHttpUtil = mockStatic(HttpUtil.class);
         MockedStatic<SessionUtilExternalBrowser> mockedSessionUtilExternalBrowser =
-            mockStatic(SessionUtilExternalBrowser.class)) {
+            mockStatic(SessionUtilExternalBrowser.class, CALLS_REAL_METHODS)) {
 
       initMock(mockedHttpUtil, mockedSessionUtilExternalBrowser);
       SessionUtil.deleteIdTokenCache("testaccount.snowflakecomputing.com", "testuser");

@@ -5,17 +5,19 @@ package net.snowflake.client.core;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.google.common.base.Strings;
 import java.awt.Desktop;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.PrintWriter;
 import java.net.InetAddress;
+import java.net.MalformedURLException;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.net.URL;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
@@ -28,6 +30,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.TimeZone;
+import java.util.concurrent.TimeUnit;
 import net.snowflake.client.jdbc.ErrorCode;
 import net.snowflake.client.jdbc.SnowflakeSQLException;
 import net.snowflake.client.log.SFLogger;
@@ -103,12 +106,14 @@ public class SessionUtilExternalBrowser {
   String token;
   private boolean consentCacheIdToken;
   private String proofKey;
-  private String origin;
   private AuthExternalBrowserHandlers handlers;
-  private static final String PREFIX_GET = "GET ";
-  private static final String PREFIX_POST = "POST ";
-  private static final String PREFIX_OPTIONS = "OPTIONS ";
-  private static final String PREFIX_USER_AGENT = "USER-AGENT: ";
+
+  // Upper bound on a single localhost callback request we will buffer. The largest legitimate
+  // request (SSO token plus headers) is a few KB; this only guards against a misbehaving local
+  // client that advertises a huge Content-Length.
+  private static final int MAX_REQUEST_LENGTH = 1 << 20; // 1 MiB
+  // Queue depth so a CORS OPTIONS preflight and the following POST can both sit in accept().
+  static final int CALLBACK_SOCKET_BACKLOG = 5;
   private static Charset UTF8_CHARSET;
 
   static {
@@ -124,7 +129,6 @@ public class SessionUtilExternalBrowser {
     this.loginInput = loginInput;
     this.handlers = handlers;
     this.consentCacheIdToken = true; // true by default
-    this.origin = null;
   }
 
   /**
@@ -137,7 +141,7 @@ public class SessionUtilExternalBrowser {
     try {
       return new ServerSocket(
           0, // free port
-          0, // default number of connections
+          CALLBACK_SOCKET_BACKLOG,
           InetAddress.getByName("localhost"));
     } catch (IOException ex) {
       throw new SFException(ex, ErrorCode.NETWORK_ERROR, ex.getMessage());
@@ -288,21 +292,37 @@ public class SessionUtilExternalBrowser {
       }
 
       while (true) {
+        applyRejectedCallbackTimeout(ssocket);
         Socket socket = ssocket.accept(); // start accepting the request
         try {
+          applyRejectedCallbackTimeout(socket);
           BufferedReader in =
               new BufferedReader(new InputStreamReader(socket.getInputStream(), UTF8_CHARSET));
-          char[] buf = new char[16384];
-          int strLen = in.read(buf);
-          String[] rets = new String(buf, 0, strLen).split("\r\n");
-          if (!processOptions(rets, socket)) {
-            processSamlToken(rets, socket);
+          String request = readRequest(in);
+          if (request.isEmpty()) {
+            // e.g. a browser preconnect socket that closed without sending a request.
+            logger.debug("Received empty request on localhost callback socket. Ignoring.");
+            continue;
+          }
+          if (processOptions(request, socket)) {
+            continue;
+          }
+          String method = getRequestMethod(request);
+          String requestOrigin = extractHeader(request, "Origin");
+          if (!isCallbackOriginAllowed(method, requestOrigin)) {
+            logger.debug("Ignoring localhost callback whose Origin does not match the server URL.");
+            onRejectedCallback(requestOrigin);
+            continue;
+          }
+          if (processSamlToken(request, socket, getResponseOrigin(requestOrigin))) {
             break;
           }
         } finally {
           socket.close();
         }
       }
+    } catch (SocketTimeoutException ex) {
+      throw rejectedCallbackTimeout(ex);
     } catch (IOException ex) {
       throw new SFException(ex, ErrorCode.NETWORK_ERROR, ex.getMessage());
     } finally {
@@ -314,65 +334,88 @@ public class SessionUtilExternalBrowser {
     }
   }
 
-  private boolean processOptions(String[] rets, Socket socket) throws IOException {
-    String targetLine = null;
-    String userAgent = null;
-    String requestedHeaderLine = null;
-    for (String line : rets) {
-      if (line.length() > PREFIX_OPTIONS.length()
-          && line.substring(0, PREFIX_OPTIONS.length()).equalsIgnoreCase(PREFIX_OPTIONS)) {
-        targetLine = line;
-      } else if (line.length() > PREFIX_USER_AGENT.length()
-          && line.substring(0, PREFIX_USER_AGENT.length()).equalsIgnoreCase(PREFIX_USER_AGENT)) {
-        userAgent = line;
-      } else if (line.startsWith("Access-Control-Request-Method")) {
-        String[] kv = line.split(":");
-        if (kv.length != 2) {
-          logger.error("no value for HTTP header: Access-Control-Request-Method. line={}", line);
-          return false;
+  /**
+   * Reads a full HTTP request from the localhost callback socket, reassembling fragments until the
+   * LF or CRLF end-of-headers marker plus the full {@code Content-Length} body, or EOF. Returns an
+   * empty string when the peer closed without sending data (e.g. a browser preconnect socket).
+   */
+  private String readRequest(BufferedReader in) throws IOException {
+    char[] buf = new char[16384];
+    StringBuilder request = new StringBuilder();
+    int bodyStart = -1;
+    int contentLength = 0;
+    while (request.length() < MAX_REQUEST_LENGTH) {
+      int strLen = in.read(buf);
+      if (strLen < 0) {
+        break;
+      }
+      request.append(buf, 0, strLen);
+      if (bodyStart < 0) {
+        int headerEnd = findHeaderEnd(request);
+        if (headerEnd >= 0) {
+          bodyStart = headerEnd + headerTerminatorLength(request, headerEnd);
+          contentLength = getContentLength(request.substring(0, headerEnd));
         }
-        if (!kv[1].trim().contains("POST")) {
-          return false;
-        }
-      } else if (line.startsWith("Access-Control-Request-Headers")) {
-        String[] kv = line.split(":");
-        if (kv.length != 2) {
-          logger.error("no value for HTTP header: Access-Control-Request-Method. line={}", line);
-          return false;
-        }
-        requestedHeaderLine = kv[1].trim();
-      } else if (line.startsWith("Origin")) {
-        String[] kv = line.split(":");
-        if (kv.length < 2) {
-          logger.error("no value for HTTP header: Origin. line={}", line);
-          return false;
-        }
-        this.origin = line.substring(line.indexOf(':') + 1).trim();
+      }
+      if (bodyStart >= 0
+          && request.substring(bodyStart).getBytes(UTF8_CHARSET).length >= contentLength) {
+        break;
       }
     }
-    if (userAgent != null) {
-      logger.debug("{}", userAgent);
+    return request.toString();
+  }
+
+  /**
+   * Returns the {@code Content-Length} header value, or {@code 0} when the header is absent or
+   * unparseable.
+   */
+  private static int getContentLength(String headers) {
+    String value = extractHeader(headers, "Content-Length");
+    if (value != null) {
+      try {
+        return Math.max(0, Integer.parseInt(value));
+      } catch (NumberFormatException ex) {
+        return 0;
+      }
     }
-    if (Strings.isNullOrEmpty(targetLine)
-        || Strings.isNullOrEmpty(requestedHeaderLine)
-        || Strings.isNullOrEmpty(this.origin)) {
+    return 0;
+  }
+
+  private boolean processOptions(String request, Socket socket) throws IOException {
+    if (!"OPTIONS".equalsIgnoreCase(getRequestMethod(request))) {
       return false;
     }
-    returnToBrowserForOptions(requestedHeaderLine, socket);
+
+    String userAgent = extractHeader(request, "User-Agent");
+    if (userAgent != null) {
+      logger.debug("USER-AGENT: {}", userAgent);
+    }
+    String requestOrigin = extractHeader(request, "Origin");
+    String requestedMethod = extractHeader(request, "Access-Control-Request-Method");
+    String requestedHeaders = extractHeader(request, "Access-Control-Request-Headers");
+    if (requestOrigin != null
+        && originMatchesServer(requestOrigin, loginInput.getServerUrl())
+        && "POST".equalsIgnoreCase(requestedMethod)
+        && requestedHeadersAllowed(requestedHeaders)) {
+      returnToBrowserForOptions(requestOrigin, socket);
+    } else {
+      logger.debug("Ignoring localhost CORS preflight that does not match callback requirements.");
+      onRejectedCallback(requestOrigin);
+    }
     return true;
   }
 
-  private void returnToBrowserForOptions(String requestedHeader, Socket socket) throws IOException {
+  private void returnToBrowserForOptions(String requestOrigin, Socket socket) throws IOException {
     PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
     SimpleDateFormat fmt = new SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss");
     fmt.setTimeZone(TimeZone.getTimeZone("UTC"));
     String[] content = {
       "HTTP/1.1 200 OK",
       String.format("Date: %s", fmt.format(new Date()) + " GMT"),
-      "Access-Control-Allow-Methods: POST, GET",
-      String.format("Access-Control-Allow-Headers: %s", requestedHeader),
+      "Access-Control-Allow-Methods: POST",
+      "Access-Control-Allow-Headers: Content-Type",
       "Access-Control-Max-Age: 86400",
-      String.format("Access-Control-Allow-Origin: %s", this.origin),
+      String.format("Access-Control-Allow-Origin: %s", requestOrigin),
       "",
       ""
     };
@@ -386,43 +429,45 @@ public class SessionUtilExternalBrowser {
   }
 
   /**
-   * Receives SAML token from Snowflake via web browser
+   * Receives SAML token from Snowflake via web browser.
    *
-   * @param socket socket
+   * @return {@code true} when a token was received and the success response was written; {@code
+   *     false} when the request carried no token so the listen loop continues
    * @throws IOException if any IO error occurs
-   * @throws SFException if a HTTP request from browser is invalid
    */
-  private void processSamlToken(String[] rets, Socket socket) throws IOException, SFException {
+  private boolean processSamlToken(String request, Socket socket, String responseOrigin)
+      throws IOException {
     String targetLine = null;
-    String userAgent = null;
-    boolean isPost = false;
-    for (String line : rets) {
-      if (line.length() > PREFIX_GET.length()
-          && line.substring(0, PREFIX_GET.length()).equalsIgnoreCase(PREFIX_GET)) {
-        targetLine = line;
-      } else if (line.length() > PREFIX_POST.length()
-          && line.substring(0, PREFIX_POST.length()).equalsIgnoreCase(PREFIX_POST)) {
-        targetLine = rets[rets.length - 1];
-        isPost = true;
-      } else if (line.length() > PREFIX_USER_AGENT.length()
-          && line.substring(0, PREFIX_USER_AGENT.length()).equalsIgnoreCase(PREFIX_USER_AGENT)) {
-        userAgent = line;
-      }
+    String method = getRequestMethod(request);
+    boolean isPost = "POST".equalsIgnoreCase(method);
+    if ("GET".equalsIgnoreCase(method)) {
+      targetLine = getRequestLine(request);
+    } else if (isPost) {
+      targetLine = getRequestBody(request);
     }
+    String userAgent = extractHeader(request, "User-Agent");
     if (targetLine == null) {
-      throw new SFException(
-          ErrorCode.NETWORK_ERROR, "Invalid HTTP request. No token is given from the browser.");
+      logger.debug("Ignoring localhost callback with no token.");
+      return false;
     }
     if (userAgent != null) {
-      logger.debug("{}", userAgent);
+      logger.debug("USER-AGENT: {}", userAgent);
     }
 
     try {
       // attempt to get JSON response
       extractJsonTokenFromPostRequest(targetLine);
     } catch (IOException ex) {
-      String parameters =
-          isPost ? extractTokenFromPostRequest(targetLine) : extractTokenFromGetRequest(targetLine);
+      String parameters;
+      try {
+        parameters =
+            isPost
+                ? extractTokenFromPostRequest(targetLine)
+                : extractTokenFromGetRequest(targetLine);
+      } catch (SFException ex0) {
+        logger.debug("Ignoring localhost callback that is not a token request.");
+        return false;
+      }
       try {
         URI inputParameter = new URI(parameters);
         for (NameValuePair urlParam : URLEncodedUtils.parse(inputParameter, UTF8_CHARSET)) {
@@ -432,26 +477,26 @@ public class SessionUtilExternalBrowser {
           }
         }
       } catch (URISyntaxException ex0) {
-        throw new SFException(
-            ErrorCode.NETWORK_ERROR,
-            String.format(
-                "Invalid HTTP request. No token is given from the browser. %s, err: %s",
-                targetLine, ex0));
+        logger.debug("Ignoring localhost callback with unparseable token parameters.");
+        return false;
       }
     }
     if (this.token == null) {
-      throw new SFException(
-          ErrorCode.NETWORK_ERROR,
-          String.format(
-              "Invalid HTTP request. No token is given from the browser: %s", targetLine));
+      logger.debug("Ignoring localhost callback with no token.");
+      return false;
     }
 
-    returnToBrowser(socket);
+    returnToBrowser(socket, responseOrigin);
+    return true;
   }
 
   private void extractJsonTokenFromPostRequest(String targetLine) throws IOException {
     JsonNode jsonNode = mapper.readTree(targetLine);
-    this.token = jsonNode.get("token").asText();
+    JsonNode tokenNode = jsonNode == null ? null : jsonNode.get("token");
+    if (tokenNode == null || tokenNode.isNull()) {
+      throw new IOException("JSON callback has no token");
+    }
+    this.token = tokenNode.asText();
     this.consentCacheIdToken = jsonNode.get("consent").asBoolean();
   }
 
@@ -478,15 +523,15 @@ public class SessionUtilExternalBrowser {
    * @param socket client socket
    * @throws IOException if any IO error occurs
    */
-  private void returnToBrowser(Socket socket) throws IOException {
+  private void returnToBrowser(Socket socket, String responseOrigin) throws IOException {
     PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
 
     List<String> content = new ArrayList<>();
     content.add("HTTP/1.0 200 OK");
     content.add("Content-Type: text/html");
     String responseText;
-    if (this.origin != null) {
-      content.add(String.format("Access-Control-Allow-Origin: %s", this.origin));
+    if (responseOrigin != null) {
+      content.add(String.format("Access-Control-Allow-Origin: %s", responseOrigin));
       content.add("Vary: Accept-Encoding, Origin");
       Map<String, Object> data = new HashMap<>();
       data.put("consent", this.consentCacheIdToken);
@@ -510,6 +555,140 @@ public class SessionUtilExternalBrowser {
       out.print(content.get(i));
     }
     out.flush();
+  }
+
+  private boolean isCallbackOriginAllowed(String method, String requestOrigin) {
+    if ("GET".equalsIgnoreCase(method)
+        && (requestOrigin == null || "null".equalsIgnoreCase(requestOrigin))) {
+      return true;
+    }
+    return requestOrigin != null && originMatchesServer(requestOrigin, loginInput.getServerUrl());
+  }
+
+  private String getResponseOrigin(String requestOrigin) {
+    return requestOrigin == null || "null".equalsIgnoreCase(requestOrigin) ? null : requestOrigin;
+  }
+
+  private static boolean requestedHeadersAllowed(String requestedHeaders) {
+    if (requestedHeaders == null) {
+      return true;
+    }
+    for (String header : requestedHeaders.split(",")) {
+      String trimmed = header.trim();
+      if (!trimmed.isEmpty() && !"Content-Type".equalsIgnoreCase(trimmed)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private static boolean originMatchesServer(String requestOrigin, String serverUrl) {
+    if (serverUrl == null) {
+      return false;
+    }
+    try {
+      URL origin = new URL(requestOrigin);
+      URL server = new URL(serverUrl);
+      return isSerializedHttpOrigin(origin)
+          && isHttpScheme(server.getProtocol())
+          && origin.getProtocol().equalsIgnoreCase(server.getProtocol())
+          && origin.getHost() != null
+          && !origin.getHost().isEmpty()
+          && server.getHost() != null
+          && !server.getHost().isEmpty()
+          && origin.getHost().equalsIgnoreCase(server.getHost())
+          && effectivePort(origin) == effectivePort(server);
+    } catch (MalformedURLException ex) {
+      return false;
+    }
+  }
+
+  /**
+   * A request Origin is scheme, host, and optional port only. Path may be empty or {@code /}; the
+   * account URL may still carry its own path.
+   */
+  private static boolean isSerializedHttpOrigin(URL origin) {
+    if (!isHttpScheme(origin.getProtocol())
+        || origin.getHost() == null
+        || origin.getHost().isEmpty()) {
+      return false;
+    }
+    if (origin.getUserInfo() != null || origin.getQuery() != null || origin.getRef() != null) {
+      return false;
+    }
+    String path = origin.getPath();
+    return path == null || path.isEmpty() || "/".equals(path);
+  }
+
+  private static boolean isHttpScheme(String scheme) {
+    return "http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme);
+  }
+
+  private static int effectivePort(URL url) {
+    if (url.getPort() >= 0) {
+      return url.getPort();
+    }
+    return "https".equalsIgnoreCase(url.getProtocol()) ? 443 : 80;
+  }
+
+  private static String extractHeader(String request, String headerName) {
+    String headers = getHeaderSection(request);
+    for (String line : headers.split("\\r?\\n")) {
+      int colon = line.indexOf(':');
+      if (colon > 0 && headerName.equalsIgnoreCase(line.substring(0, colon).trim())) {
+        return line.substring(colon + 1).trim();
+      }
+    }
+    return null;
+  }
+
+  private static String getRequestMethod(String request) {
+    String requestLine = getRequestLine(request);
+    int separator = requestLine.indexOf(' ');
+    return separator < 0 ? requestLine : requestLine.substring(0, separator);
+  }
+
+  private static String getRequestLine(String request) {
+    int lineEnd = request.indexOf('\n');
+    String requestLine = lineEnd < 0 ? request : request.substring(0, lineEnd);
+    return requestLine.endsWith("\r")
+        ? requestLine.substring(0, requestLine.length() - 1)
+        : requestLine;
+  }
+
+  private static String getHeaderSection(String request) {
+    int headerEnd = findHeaderEnd(request);
+    return headerEnd < 0 ? request : request.substring(0, headerEnd);
+  }
+
+  private static String getRequestBody(String request) {
+    int headerEnd = findHeaderEnd(request);
+    return headerEnd < 0
+        ? ""
+        : request.substring(headerEnd + headerTerminatorLength(request, headerEnd));
+  }
+
+  private static int findHeaderEnd(CharSequence request) {
+    String value = request.toString();
+    int crlfEnd = value.indexOf("\r\n\r\n");
+    int lfEnd = value.indexOf("\n\n");
+    if (crlfEnd < 0) {
+      return lfEnd;
+    }
+    if (lfEnd < 0) {
+      return crlfEnd;
+    }
+    return Math.min(crlfEnd, lfEnd);
+  }
+
+  private static int headerTerminatorLength(CharSequence request, int headerEnd) {
+    return request.length() >= headerEnd + 4
+            && request.charAt(headerEnd) == '\r'
+            && request.charAt(headerEnd + 1) == '\n'
+            && request.charAt(headerEnd + 2) == '\r'
+            && request.charAt(headerEnd + 3) == '\n'
+        ? 4
+        : 2;
   }
 
   /**
@@ -538,5 +717,84 @@ public class SessionUtilExternalBrowser {
    */
   boolean isConsentCacheIdToken() {
     return this.consentCacheIdToken;
+  }
+
+  static final int REJECTED_CALLBACK_TIMEOUT_MILLIS = 120 * 1000;
+  private static final int MAX_LOGGED_ORIGIN_LENGTH = 200;
+
+  int rejectedCallbackTimeoutMillis = REJECTED_CALLBACK_TIMEOUT_MILLIS;
+  private String rejectedCallbackOrigin;
+  private long rejectedCallbackDeadlineNanos;
+
+  /**
+   * Starts a deadline on the first callback rejected for its Origin, so a login whose callback
+   * never matches fails instead of waiting forever. Callbacks without an Origin do not start it.
+   */
+  private void onRejectedCallback(String requestOrigin) {
+    if (rejectedCallbackOrigin != null
+        || requestOrigin == null
+        || originMatchesServer(requestOrigin, loginInput.getServerUrl())) {
+      return;
+    }
+    rejectedCallbackOrigin = sanitizeOrigin(requestOrigin);
+    rejectedCallbackDeadlineNanos =
+        System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(rejectedCallbackTimeoutMillis);
+    logger.warn(
+        "Browser callback from origin {} does not match the server URL, waiting up to {} ms for a"
+            + " matching callback",
+        rejectedCallbackOrigin,
+        rejectedCallbackTimeoutMillis);
+  }
+
+  private void applyRejectedCallbackTimeout(ServerSocket serverSocket) throws IOException {
+    if (rejectedCallbackOrigin != null) {
+      serverSocket.setSoTimeout(remainingRejectedCallbackMillis());
+    }
+  }
+
+  private void applyRejectedCallbackTimeout(Socket socket) throws IOException {
+    if (rejectedCallbackOrigin != null) {
+      socket.setSoTimeout(remainingRejectedCallbackMillis());
+    }
+  }
+
+  private int remainingRejectedCallbackMillis() throws SocketTimeoutException {
+    long remaining =
+        TimeUnit.NANOSECONDS.toMillis(rejectedCallbackDeadlineNanos - System.nanoTime());
+    if (remaining <= 0) {
+      throw new SocketTimeoutException("Browser callback deadline exceeded");
+    }
+    return (int) Math.min(remaining, Integer.MAX_VALUE);
+  }
+
+  /** The error names the rejected Origin and the expected server only, never request content. */
+  private SFException rejectedCallbackTimeout(SocketTimeoutException ex) {
+    if (rejectedCallbackOrigin == null) {
+      return new SFException(ex, ErrorCode.NETWORK_ERROR, ex.getMessage());
+    }
+    return new SFException(
+        ex,
+        ErrorCode.NETWORK_ERROR,
+        String.format(
+            "External browser authentication failed: the browser callback came from origin %s,"
+                + " which does not match the server URL %s",
+            rejectedCallbackOrigin,
+            serverOrigin(loginInput.getServerUrl())));
+  }
+
+  private static String serverOrigin(String serverUrl) {
+    try {
+      URL server = new URL(serverUrl);
+      return server.getProtocol() + "://" + server.getHost() + ":" + effectivePort(server);
+    } catch (MalformedURLException | NullPointerException ex) {
+      return "unknown";
+    }
+  }
+
+  private static String sanitizeOrigin(String origin) {
+    String printable = origin.replaceAll("\\p{Cntrl}", "");
+    return printable.length() > MAX_LOGGED_ORIGIN_LENGTH
+        ? printable.substring(0, MAX_LOGGED_ORIGIN_LENGTH)
+        : printable;
   }
 }
