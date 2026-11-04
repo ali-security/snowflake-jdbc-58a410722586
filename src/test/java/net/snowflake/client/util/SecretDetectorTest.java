@@ -2,6 +2,8 @@ package net.snowflake.client.util;
 
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -378,5 +380,97 @@ public class SecretDetectorTest {
     assertThat(
         "Nested Jackson array node is not masked successfully",
         maskedNestedArrayStr.equals(SecretDetector.maskJacksonNode(objNode4).toString()));
+  }
+
+  @Test
+  public void testEncryptionMaterialFilter() throws Exception {
+    String messageText =
+        "{\"data\":"
+            + "{\"autoCompress\":true,"
+            + "\"overwrite\":false,"
+            + "\"clientShowEncryptionParameter\":true,"
+            + "\"encryptionMaterial\":{\"queryStageMasterKey\":\"asdfasdfasdfasdf==\",\"queryId\":\"01b6f5ba-0002-0181-0000-11111111da\",\"smkId\":1111},"
+            + "\"stageInfo\":{\"locationType\":\"AZURE\", \"region\":\"eastus2\"}";
+
+    String filteredMessageText =
+        "{\"data\":"
+            + "{\"autoCompress\":true,"
+            + "\"overwrite\":false,"
+            + "\"clientShowEncryptionParameter\":true,"
+            + "\"encryptionMaterial\" : ****,"
+            + "\"stageInfo\":{\"locationType\":\"AZURE\", \"region\":\"eastus2\"}";
+
+    String result = SecretDetector.filterEncryptionMaterial(messageText);
+
+    assertEquals(filteredMessageText, result);
+  }
+
+  @Test
+  public void testEncryptionMaterialFilterDownloadArray() throws Exception {
+    // GET (download) responses carry one encryption material entry per file
+    String messageText =
+        "{\"data\":"
+            + "{\"command\":\"DOWNLOAD\","
+            + "\"encryptionMaterial\":[{\"queryStageMasterKey\":\"asdfasdfasdfasdf==\",\"queryId\":\"01b6f5ba-0002-0181-0000-11111111da\",\"smkId\":1111},"
+            + "{\"queryStageMasterKey\":\"qwerqwerqwerqwer==\",\"queryId\":\"01b6f5ba-0002-0181-0000-11111111db\",\"smkId\":2222}],"
+            + "\"stageInfo\":{\"locationType\":\"AZURE\", \"region\":\"eastus2\"}";
+
+    String filteredMessageText =
+        "{\"data\":"
+            + "{\"command\":\"DOWNLOAD\","
+            + "\"encryptionMaterial\" : ****,"
+            + "\"stageInfo\":{\"locationType\":\"AZURE\", \"region\":\"eastus2\"}";
+
+    assertEquals(filteredMessageText, SecretDetector.filterEncryptionMaterial(messageText));
+  }
+
+  @Test
+  public void testMaskSecretsMasksEncryptionMaterialInPutGetResponse() throws Exception {
+    final String uploadKey = "c2VjcmV0UXVlcnlTdGFnZU1hc3RlcktleTE=";
+    final String downloadKey1 = "ZG93bmxvYWRRdWVyeVN0YWdlTWFzdGVyS2V5MQ==";
+    final String downloadKey2 = "ZG93bmxvYWRRdWVyeVN0YWdlTWFzdGVyS2V5Mg==";
+    final ObjectMapper mapper = ObjectMapperFactory.getObjectMapper();
+
+    // PUT response as returned by GS and logged by SnowflakeFileTransferAgent.parseCommandInGS
+    ObjectNode uploadResponse = mapper.createObjectNode();
+    ObjectNode uploadData = uploadResponse.putObject("data");
+    uploadData.put("command", "UPLOAD");
+    uploadData.put("clientShowEncryptionParameter", true);
+    ObjectNode uploadEncMat = uploadData.putObject("encryptionMaterial");
+    uploadEncMat.put("queryStageMasterKey", uploadKey);
+    uploadEncMat.put("queryId", "01b6f5ba-0002-0181-0000-11111111da");
+    uploadEncMat.put("smkId", 1111);
+    uploadData.putObject("stageInfo").put("locationType", "S3");
+    uploadResponse.put("success", true);
+
+    String maskedUpload = SecretDetector.maskSecrets(uploadResponse.toString());
+    assertFalse(
+        "PUT encryption material leaked: " + maskedUpload, maskedUpload.contains(uploadKey));
+    assertTrue(maskedUpload.contains("\"encryptionMaterial\" : ****"));
+    assertTrue(maskedUpload.contains("\"stageInfo\":{\"locationType\":\"S3\"}"));
+
+    // GET response as returned by GS and logged by SnowflakeFileTransferAgent.parseCommandInGS
+    ObjectNode downloadResponse = mapper.createObjectNode();
+    ObjectNode downloadData = downloadResponse.putObject("data");
+    downloadData.put("command", "DOWNLOAD");
+    ArrayNode downloadEncMats = downloadData.putArray("encryptionMaterial");
+    ObjectNode downloadEncMat1 = downloadEncMats.addObject();
+    downloadEncMat1.put("queryStageMasterKey", downloadKey1);
+    downloadEncMat1.put("queryId", "01b6f5ba-0002-0181-0000-11111111db");
+    downloadEncMat1.put("smkId", 2222);
+    ObjectNode downloadEncMat2 = downloadEncMats.addObject();
+    downloadEncMat2.put("queryStageMasterKey", downloadKey2);
+    downloadEncMat2.put("queryId", "01b6f5ba-0002-0181-0000-11111111dc");
+    downloadEncMat2.put("smkId", 3333);
+    downloadData.putObject("stageInfo").put("locationType", "S3");
+    downloadResponse.put("success", true);
+
+    String maskedDownload = SecretDetector.maskSecrets(downloadResponse.toString());
+    assertFalse(
+        "GET encryption material leaked: " + maskedDownload, maskedDownload.contains(downloadKey1));
+    assertFalse(
+        "GET encryption material leaked: " + maskedDownload, maskedDownload.contains(downloadKey2));
+    assertTrue(maskedDownload.contains("\"encryptionMaterial\" : ****"));
+    assertTrue(maskedDownload.contains("\"stageInfo\":{\"locationType\":\"S3\"}"));
   }
 }

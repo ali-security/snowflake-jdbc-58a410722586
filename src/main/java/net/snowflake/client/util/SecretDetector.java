@@ -72,6 +72,12 @@ public class SecretDetector {
           "(token|assertion content)" + "(['\"\\s:=]+)" + "([a-z0-9=/_\\-+]{8,})",
           Pattern.CASE_INSENSITIVE);
 
+  // "encryptionMaterial" is a single object for PUT (upload) responses and an array of objects
+  // for GET (download) responses
+  private static final Pattern ENCRYPTION_MATERIAL_PATTERN =
+      Pattern.compile(
+          "\"encryptionMaterial\"\\s*:\\s*(\\{.*?\\}|\\[.*?\\])", Pattern.CASE_INSENSITIVE);
+
   private static final int LOOK_AHEAD = 10;
 
   // only attempt to find secrets in its leading 100Kb SNOW-30961
@@ -211,7 +217,8 @@ public class SecretDetector {
    */
   public static String maskSecrets(String text) {
     return filterAccessTokens(
-        filterConnectionTokens(filterPassword(filterSASTokens(filterAWSKeys(text)))));
+        filterConnectionTokens(
+            filterPassword(filterSASTokens(filterAWSKeys(filterEncryptionMaterial(text))))));
   }
 
   /**
@@ -251,6 +258,23 @@ public class SecretDetector {
       message = gcsMatcher.replaceAll("\"privateKeyData\": \"XXXX\"");
     }
 
+    return message;
+  }
+
+  /**
+   * Filter encryption material that may be buried inside a JSON string.
+   *
+   * @param message the message text which may contain encryption material
+   * @return Return filtered message
+   */
+  public static String filterEncryptionMaterial(String message) {
+    Matcher matcher =
+        ENCRYPTION_MATERIAL_PATTERN.matcher(
+            message.length() <= MAX_LENGTH ? message : message.substring(0, MAX_LENGTH));
+
+    if (matcher.find()) {
+      return matcher.replaceAll("\"encryptionMaterial\" : ****");
+    }
     return message;
   }
 
