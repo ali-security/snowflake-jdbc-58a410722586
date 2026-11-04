@@ -35,6 +35,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
 import net.snowflake.client.core.Constants;
 import net.snowflake.client.core.HttpClientSettingsKey;
 import net.snowflake.client.core.OCSPMode;
@@ -869,5 +870,46 @@ public class SnowflakeUtil {
   @SnowflakeJdbcInternalApi
   public static boolean isWindows() {
     return Constants.getOS() == Constants.OS.WINDOWS;
+  }
+
+  /**
+   * Converts a simple wildcard pattern (where only '*' is special) into a safe regex string by
+   * quoting all literal parts via Pattern.quote(), preventing any regex metacharacters from being
+   * interpreted. This avoids ReDoS vulnerabilities when patterns originate from user input.
+   *
+   * <p>Every literal part between two wildcards is matched inside an atomic group against its first
+   * occurrence, so several wildcards can never backtrack against each other (which would otherwise
+   * make the matching time grow polynomially with the number of wildcards).
+   *
+   * @param glob wildcard pattern, e.g. {@code *.example.com}
+   * @return case insensitive pattern matching the whole input against the wildcard pattern
+   */
+  @SnowflakeJdbcInternalApi
+  public static Pattern globToSafePattern(String glob) {
+    String[] parts = glob.split("\\*", -1);
+    StringBuilder safeRegex = new StringBuilder(Pattern.quote(parts[0]));
+    for (int i = 1; i < parts.length - 1; i++) {
+      safeRegex.append("(?>.*?").append(Pattern.quote(parts[i])).append(')');
+    }
+    if (parts.length > 1) {
+      safeRegex.append(".*").append(Pattern.quote(parts[parts.length - 1]));
+    }
+    return Pattern.compile(safeRegex.toString(), Pattern.CASE_INSENSITIVE);
+  }
+
+  /**
+   * Checks whether a hostname matches a simple wildcard pattern (e.g. an entry of nonProxyHosts).
+   * Only '*' is treated as a wildcard; every other character is matched literally.
+   *
+   * @param hostname hostname to check
+   * @param pattern wildcard pattern
+   * @return true if the hostname matches the pattern, false otherwise or if any argument is null
+   */
+  @SnowflakeJdbcInternalApi
+  public static boolean hostnameMatchesGlob(String hostname, String pattern) {
+    if (hostname == null || pattern == null) {
+      return false;
+    }
+    return globToSafePattern(pattern.trim()).matcher(hostname).matches();
   }
 }

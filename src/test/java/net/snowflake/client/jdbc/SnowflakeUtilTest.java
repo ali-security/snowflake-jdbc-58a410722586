@@ -4,8 +4,11 @@
 package net.snowflake.client.jdbc;
 
 import static net.snowflake.client.jdbc.SnowflakeUtil.getSnowflakeType;
+import static net.snowflake.client.jdbc.SnowflakeUtil.hostnameMatchesGlob;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertTrue;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -125,5 +128,94 @@ public class SnowflakeUtilTest extends BaseJDBCTest {
     fieldNode.put("collation", collation);
     fieldNode.put("length", length);
     return fieldNode;
+  }
+
+  @Test
+  public void testHostnameMatchesGlob() {
+    // Exact match
+    assertTrue(hostnameMatchesGlob("localhost", "localhost"));
+    assertTrue(hostnameMatchesGlob("example.com", "example.com"));
+    assertFalse(hostnameMatchesGlob("example.com", "other.com"));
+
+    // Case insensitive
+    assertTrue(hostnameMatchesGlob("EXAMPLE.COM", "example.com"));
+    assertTrue(hostnameMatchesGlob("example.com", "EXAMPLE.COM"));
+
+    // Leading wildcard
+    assertTrue(hostnameMatchesGlob("foo.example.com", "*.example.com"));
+    assertTrue(hostnameMatchesGlob("bar.baz.example.com", "*.example.com"));
+    assertFalse(hostnameMatchesGlob("example.com", "*.example.com"));
+    assertFalse(hostnameMatchesGlob("notexample.com", "*.example.com"));
+
+    // Trailing wildcard
+    assertTrue(hostnameMatchesGlob("192.168.1.1", "192.168.*"));
+    assertFalse(hostnameMatchesGlob("10.0.0.1", "192.168.*"));
+
+    // Middle wildcard
+    assertTrue(hostnameMatchesGlob("foo.bar.com", "foo.*.com"));
+    assertFalse(hostnameMatchesGlob("bar.baz.com", "foo.*.com"));
+
+    // Wildcard only
+    assertTrue(hostnameMatchesGlob("anything.example.com", "*"));
+    assertTrue(hostnameMatchesGlob("", "*"));
+
+    // Whitespace trimming
+    assertTrue(hostnameMatchesGlob("example.com", "  example.com  "));
+
+    // Null safety
+    assertFalse(hostnameMatchesGlob(null, "*.example.com"));
+    assertFalse(hostnameMatchesGlob("example.com", null));
+    assertFalse(hostnameMatchesGlob(null, null));
+
+    // Regex metacharacters are treated as literals, not regex
+    assertFalse(hostnameMatchesGlob("aaa", "(a+)+"));
+    assertFalse(hostnameMatchesGlob("exampleXcom", "example.com"));
+    assertTrue(hostnameMatchesGlob("example.com", "example.com"));
+  }
+
+  @Test
+  public void testHostnameMatchesGlobMultipleWildcards() {
+    assertTrue(hostnameMatchesGlob("foo.bar.example.com", "foo.*.*.com"));
+    assertTrue(hostnameMatchesGlob("fooXbarYbaz", "foo*bar*baz"));
+    assertFalse(hostnameMatchesGlob("fooXbaz", "foo*bar*baz"));
+    assertTrue(hostnameMatchesGlob("ab", "a**b"));
+    assertTrue(hostnameMatchesGlob("ababab", "*aba*ab"));
+    assertTrue(hostnameMatchesGlob("aba", "a*b*a"));
+    assertFalse(hostnameMatchesGlob("a", "a*a"));
+    assertTrue(hostnameMatchesGlob("bab", "*a*"));
+    assertTrue(hostnameMatchesGlob("app.internal.example.com", "*.internal.*"));
+    assertFalse(hostnameMatchesGlob("app.external.example.com", "*.internal.*"));
+    // Regex metacharacters between wildcards are literals as well
+    assertTrue(hostnameMatchesGlob("x(a+)+y", "*(a+)+*"));
+    assertFalse(hostnameMatchesGlob("xaaay", "*(a+)+*"));
+  }
+
+  @Test
+  public void testHostnameMatchesGlobReDoSPatternDoesNotHang() {
+    // Exact ReDoS payload from the vulnerability report (SNOW-3104251).
+    // With unquoted regex this would cause catastrophic backtracking.
+    String maliciousHost =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac";
+    long start = System.currentTimeMillis();
+    assertFalse(hostnameMatchesGlob(maliciousHost, "(a+)+"));
+    long elapsed = System.currentTimeMillis() - start;
+    assertTrue(
+        "Glob matching should complete nearly instantly, took " + elapsed + "ms", elapsed < 1000);
+  }
+
+  @Test
+  public void testHostnameMatchesGlobManyWildcardsDoNotHang() {
+    // Many wildcards must not backtrack against each other: as plain '.*' sequences these patterns
+    // need a number of steps that grows polynomially with the number of wildcards.
+    String maliciousHost =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac";
+    long start = System.currentTimeMillis();
+    assertFalse(hostnameMatchesGlob(maliciousHost, "*************************b"));
+    assertFalse(hostnameMatchesGlob(maliciousHost, "*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b"));
+    assertTrue(hostnameMatchesGlob(maliciousHost, "*************************c"));
+    assertTrue(hostnameMatchesGlob(maliciousHost, "*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*c"));
+    long elapsed = System.currentTimeMillis() - start;
+    assertTrue(
+        "Glob matching should complete nearly instantly, took " + elapsed + "ms", elapsed < 1000);
   }
 }
