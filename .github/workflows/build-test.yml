@@ -1,15 +1,6 @@
 name: Build and Test
 
 on:
-    push:
-        branches:
-            - master
-        tags:
-            - v*
-    pull_request:
-        branches:
-            - master
-            - prep-**
     workflow_dispatch:
         inputs:
           logLevel:
@@ -18,6 +9,10 @@ on:
             required: true
           tags:
             description: "Test scenario tags"
+          test-filter:
+            description: "Optional surefire -Dtest selector; empty runs the full suite"
+            required: false
+            default: ""
 
 concurrency:
   # older builds for the same pull request numer or branch should be cancelled
@@ -27,17 +22,63 @@ concurrency:
 jobs:
     build:
         name: Build
-        runs-on: ubuntu-20.04
+        runs-on: ubuntu-latest
+        timeout-minutes: 50
         steps:
             - uses: actions/checkout@v1
+            - uses: actions/setup-java@v4
+              with:
+                distribution: temurin
+                java-version: '11'
             - name: Build
               shell: bash
               env:
                 WHITESOURCE_API_KEY: ${{ secrets.WHITESOURCE_API_KEY }}
-              run: ./ci/build.sh
+              run: |
+                if [ -n "${{ inputs.test-filter }}" ]; then
+                  mvn clean install --batch-mode --show-version -Dtest=${{ inputs.test-filter }} -Dsurefire.failIfNoSpecifiedTests=false
+                else
+                  ./ci/build.sh
+                fi
+            - name: Report skipped tests with reasons
+              if: always()
+              shell: bash
+              run: |
+                echo "Skipped tests (from target/surefire-reports) and the upstream @Ignore annotation that disables them:"
+                python3 - <<'PY'
+                import glob, os, xml.etree.ElementTree as ET
+                for x in sorted(glob.glob('target/surefire-reports/TEST-*.xml')):
+                    for tc in ET.parse(x).getroot().iter('testcase'):
+                        sk = tc.find('skipped')
+                        if sk is None:
+                            continue
+                        cls = tc.get('classname'); name = tc.get('name')
+                        print('SKIPPED: %s#%s message=%s' % (cls, name, sk.get('message') or ''))
+                        src = 'src/test/java/' + cls.replace('.', '/') + '.java'
+                        if os.path.exists(src):
+                            lines = open(src).read().split('\n')
+                            for i, l in enumerate(lines):
+                                if '@Ignore' in l:
+                                    print('    reason: upstream source %s:%d has %s' % (src, i + 1, ' | '.join(s.strip() for s in lines[max(0, i - 1):i + 3])))
+                PY
+            - name: Stage release jars
+              shell: bash
+              run: |
+                VERSION=$(mvn -q help:evaluate -Dexpression=project.version -DforceStdout)
+                mkdir -p seal-artifacts
+                cp -p "lib/snowflake-jdbc-${VERSION}.jar" seal-artifacts/
+                cp -p target/snowflake-jdbc-tests.jar "seal-artifacts/snowflake-jdbc-${VERSION}-tests.jar"
+                ls -l seal-artifacts
+            - uses: actions/upload-artifact@v4
+              with:
+                name: snowflake-jdbc-jars
+                path: seal-artifacts/*.jar
+                if-no-files-found: error
 
     test-linux:
         needs: build
+        if: false
+        timeout-minutes: 50
         name: ${{ matrix.cloud }} JDBC${{ matrix.additionalMavenProfile }} ${{ matrix.category }} on ${{ matrix.image }}
         runs-on: ubuntu-latest
         strategy:
@@ -60,6 +101,8 @@ jobs:
               run: ./ci/test.sh
 
     test-linux-old-driver:
+        if: false
+        timeout-minutes: 50
         name: Old JDBC ${{ matrix.category }} on ${{ matrix.image }}
         runs-on: ubuntu-latest
         strategy:

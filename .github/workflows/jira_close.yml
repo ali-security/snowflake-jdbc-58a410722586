@@ -1,8 +1,7 @@
 name: Jira closure
 
 on:
-  issues:
-    types: [closed, deleted]
+  workflow_dispatch:
 
 jobs:
   close-issue:

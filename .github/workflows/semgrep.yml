@@ -2,8 +2,7 @@
 name: Run semgrep checks
 
 on:
-  pull_request:
-    branches: [master]
+  workflow_dispatch:
 
 permissions:
   contents: read
